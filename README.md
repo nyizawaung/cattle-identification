@@ -1,4 +1,3 @@
-[![trophy](https://github-profile-trophy.vercel.app/?username=nyizawaung)](https://github.com/ryo-ma/github-profile-trophy)
 # CATTLE IDENTIFICATION
 Detection with detctron 2
 Customized tracking with centroid based on center of mask location
