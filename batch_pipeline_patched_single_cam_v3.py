@@ -10,12 +10,15 @@ detection → tracking/ID workflow, tuned for stability & clean EOF drain:
 - Periodic health logs; optional psutil RSS counter if installed
 """
 
+import json
 import cv2
 import time
 import threading
 import itertools
 import queue
 from typing import List, Any
+
+import numpy as np
 
 # Optional memory usage (if psutil installed)
 try:
@@ -254,13 +257,17 @@ class PipelineMixin:
                         pass
                     q_put_stop(self._q_read)  # STOP MUST be delivered
                     return
-                frame = self.apply_clahe_ycrcb(frame, clip=2.5, tile=8)  #B
-                frame = self.unsharp_mask(frame, radius=1.4, amount=1.0)  #B
+                
                 frame_counters[i] += 1
                 if frame_counters[i] % (self._frame_skip + 1) != 0:
                     progressed = True
                     continue
-
+                #frame = self.apply_clahe_ycrcb(frame, clip=2.5, tile=8)  #B
+                #frame = self.unsharp_mask(frame, radius=1.4, amount=1.0)  #B
+                if self.NEED_PREPROCESS:
+                    frame = self.apply_clahe_ycrcb(frame,clip=1, tile=16)  #B
+                    frame = self.unsharp_mask(frame, radius=1.0, amount=0.5)  #B
+                #put original frame in good condition
                 try:
                     frame = cv2.resize(frame, self._resolution, interpolation=cv2.INTER_AREA)
                 except Exception as e:
@@ -368,6 +375,7 @@ class PipelineMixin:
 
             # === Your per-cam CoreProcess stage ===
             frame_infos = []
+            self.FRAME_COUNTER += 1
             for cam_idx, (frame, outputs) in enumerate(zip(images, detections)):
                 instances = outputs["instances"].to("cpu")
                 h, w = frame.shape[:2]
@@ -377,16 +385,85 @@ class PipelineMixin:
                     is_last_cam=(cam_idx == 1),  # hardcoded for 4-5-6 pair
                     y2_threshold=h - 40
                 )
-                info = self.CoreProcess(boxes, masks_np, h, w, frame, cam_idx)
+                info, filenames = self.CoreProcess(boxes, masks_np, h, w, frame, cam_idx,self.FRAME_COUNTER) #info, masks for gathering json data
                 frame_infos.append(info)
                 images[cam_idx] = frame  # modify in-place as needed
 
+                json_format = (self.FRAME_COUNTER, info.tracked_ids, info.boxes, info.predicted_ids, filenames)
+                self.append_tracking_record(*json_format)
             # === Cross-cam merge, draw, and output ===
             _ = self._merge_draw_and_write(images, frame_infos, meta)
 
             if time.time() - last_log >= 10:
                 print(f"[track] bid={bid}")
                 last_log = time.time()
+    
+    def append_tracking_record(
+        self,
+        frame_id,
+        tracking_ids,
+        bboxes,
+        #masks,
+        predicted_ids,
+        filenames,
+    ):
+        try:
+            #print(f'frame_id: {frame_id}, number of records: {len(tracking_ids)}')
+            #print(f'bboxes: {bboxes}')
+            #print(f'predicted_ids: {predicted_ids}')
+            with open(self.JSON_SAVE_PATH, "a") as f:
+                for track_id, bbox, pred, filename in zip(tracking_ids, bboxes, predicted_ids,filenames):
+                    # normalize bbox
+                    x1, y1, x2, y2, _ = bbox
+                    bbox_norm = [x1/self.save_width, y1/self.save_height, x2/self.save_width, y2/self.save_height]
+
+                    # normalize mask
+                    # mask = np.array(mask, dtype=float)
+                    # mask_norm = (mask > 0).astype(float).tolist()  # 0.0 or 1.0
+
+                    # Convert mask to polygon
+                    # polygon = self.mask_to_polygon(mask)
+
+                    # # Normalize polygon points
+                    # polygon_norm = [
+                    #     [px / self.save_width, py / self.save_height] for px, py in polygon
+                    # ]
+
+                    record = {
+                        "frameId": frame_id,
+                        "trackingId": track_id,
+                        "bbox": bbox_norm,
+                        "filename": filename,
+                        "predictedId": pred
+                    }
+                    f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            print(f'Error in append_tracking_record: {e}')
+
+    def mask_to_polygon(self,mask):
+        """
+        Converts a binary mask to polygon points (boundary).
+        Returns a list of (x, y) points.
+        """
+        mask_uint8 = (mask.astype(np.uint8) * 255)
+
+        # find contours
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if len(contours) == 0:
+            return []
+
+        # take the largest contour (in case of noise)
+        contour = max(contours, key=cv2.contourArea)
+
+        # convert to simple list
+        polygon = contour.squeeze().tolist()  # list of [x, y]
+
+        # fix contour with one point
+        if isinstance(polygon[0], int):
+            polygon = [polygon]
+
+        return polygon
 
     # =============== Drawing / Merge kept from your code ===============
     def _merge_draw_and_write(self, images, all_frame_infos, meta):
@@ -395,11 +472,13 @@ class PipelineMixin:
         all_duplicate_indexes = self.get_duplicate_indexes(
             [item for sublist in all_frame_infos for item in sublist.predicted_ids]
         )
-        tracking_to_merge = self.get_Tracking_To_Merge(all_tracking_ids)
+        #print("All duplicate indexes across cameras:", all_duplicate_indexes)
+        #print("All tracking IDs across cameras:", all_tracking_ids)
+        #tracking_to_merge = self.get_Tracking_To_Merge(all_tracking_ids)
 
         all_duplicate_tracking_ids = []
         for duplicate in all_duplicate_indexes:
-            if duplicate in ("Identifying", "Reidentifying", "unknown"):
+            if duplicate in ("Identifying", "Reidentifying", "unknown","None","Tracking"):
                 continue
             duplicate_tracking_ids = [all_tracking_ids[i] for i in all_duplicate_indexes[duplicate]]
             is_same = all(val == duplicate_tracking_ids[0] for val in duplicate_tracking_ids)
@@ -410,6 +489,7 @@ class PipelineMixin:
         if len(all_duplicate_tracking_ids) > 0:
             try:
                 self.reset_duplicate_tracking_identification(all_duplicate_tracking_ids)
+                print("Reset duplicate tracking IDs across cameras:", all_duplicate_tracking_ids)
             except Exception as e:
                 print("Warning: reset_duplicate_tracking_identification failed:", e)
 
@@ -418,34 +498,52 @@ class PipelineMixin:
         boxes_to_merge = defaultdict(list)
         for frame_info in all_frame_infos:
             mask_count = 0
-            images[frame_info.cam_counter] = cv2.addWeighted(
-                frame_info.colored_mask, 0.3,
-                images[frame_info.cam_counter], 1 - 0.3, 0
-            )
+            # images[frame_info.cam_counter] = cv2.addWeighted(
+            #     frame_info.colored_mask, 0.1,
+            #     images[frame_info.cam_counter], 1 - 0.1, 0
+            # )
+            alpha = 0.3
+
+            img = images[frame_info.cam_counter]
+            # mask = frame_info.colored_mask  # color mask (BGR)
+            # mask_gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+
+            # # boolean mask where mask exists
+            # idx = mask_gray > 0
+
+            # # blend only masked pixels
+            # img[idx] = (
+            #     img[idx] * (1 - alpha) +
+            #     mask[idx] * alpha
+            # ).astype(np.uint8)
+
+            images[frame_info.cam_counter] = img
+
             for index in frame_info.tracked_indexes:
                 x1, y1, x2, y2, area = map(int, frame_info.boxes[index])
                 tracking_id = frame_info.tracked_ids[mask_count]
                 label = 'Identifying' if tracking_id in all_duplicate_tracking_ids else f"{str(frame_info.predicted_ids[mask_count])}"
-                if tracking_id in tracking_to_merge.keys():
-                    sum_y = 0
-                    if frame_info.cam_counter > 0:
-                        sum_y = sum(meta.get("camera_heights", [])[: frame_info.cam_counter])
-                    boxes_to_merge[tracking_id] += [[x1, y1+sum_y, x2, y2+sum_y], label]
-                else:
-                    try:
-                        self.draw_bounding_box(
-                            images[frame_info.cam_counter], (x1,y1,x2,y2), label,
-                            str(frame_info.tracked_ids[mask_count]), font_scale=1
-                        )
-                    except Exception as e:
-                        print("draw_bounding_box error:", e)
+                # if tracking_id in tracking_to_merge.keys():
+                #     sum_y = 0
+                #     if frame_info.cam_counter > 0:
+                #         sum_y = sum(meta.get("camera_heights", [])[: frame_info.cam_counter])
+                #     boxes_to_merge[tracking_id] += [[x1, y1+sum_y, x2, y2+sum_y], label]
+                # else:
+                try:
+                    self.draw_bounding_box(
+                        images[frame_info.cam_counter], (x1,y1,x2,y2), label,
+                        frame_info.recheck_periods[mask_count],
+                        str(frame_info.tracked_ids[mask_count]), font_scale=1, draw_tracking=True
+                    )
+                except Exception as e:
+                    print("draw_bounding_box error:", e)
                 mask_count += 1
 
         # 3) Update missed counts
         self.IncreaseMissedCount(all_tracking_ids)
 
         # 4) Compose final stacked image
-        stacked_image = self.stack_image_from_bottom_to_top(images)
+        stacked_image = images[0]
         if stacked_image is None:
             print("Stacked image is None")
             return None
@@ -482,7 +580,7 @@ class PipelineMixin:
         if self._show:
             try:
                 imshow_size = (576, int((stacked_image.shape[0] / 2)))
-                cv2.imshow("Cattle Pipeline (queued)", cv2.resize(stacked_image, imshow_size))
+                cv2.imshow("Cattle Pipeline (queued)", stacked_image) #cv2.resize(stacked_image, imshow_size))
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     self._user_quit = True
